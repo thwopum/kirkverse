@@ -49,9 +49,9 @@ def index():
         rows = db.execute("SELECT * FROM images ORDER BY id DESC").fetchall()
     db.close()
     return render_template_string("""
-    <h1>Meme Archive</h1>
+    <h1>Kirk Archive</h1>
     <form method="get">
-        <input name="q" placeholder="Search memes..." value="{{q}}">
+        <input name="q" placeholder="Search for kirk..." value="{{q}}">
         <button type="submit">Search</button>
     </form>
     <form method="post" action="/upload" enctype="multipart/form-data">
