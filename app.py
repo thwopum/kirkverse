@@ -1,98 +1,162 @@
-from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory, jsonify, abort
-import os, sqlite3, time, uuid
+import os
+import sqlite3
 from datetime import datetime
-from slugify import slugify
-from pathlib import Path
+from flask import (
+    Flask, render_template, request,
+    redirect, url_for
+)
 
 app = Flask(__name__)
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-DB_PATH = BASE_DIR / "app.db"
-UPLOAD_DIR.mkdir(exist_ok=True)
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
-MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# =======================
+# Config
+# =======================
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, "kirkverse.db")
+
+# Save uploads into /static/uploads so we can serve with url_for('static', ...)
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "mp4", "webm", "mov"}
+
+
+# =======================
+# Helpers
+# =======================
+def allowed_file(filename: str) -> bool:
+    return (
+        "." in filename
+        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    )
+
+
+def get_media_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[1].lower()
+    if ext in {"mp4", "webm", "mov"}:
+        return "video"
+    return "image"
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row  # so we can use row["caption"]
     return conn
 
+
 def init_db():
-    db = get_db()
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS images (
-        id INTEGER PRIMARY KEY,
-        filename TEXT,
-        caption TEXT,
-        tags TEXT,
-        created_at TEXT
-    );
-    """)
-    db.commit()
-    db.close()
+    """Create posts table if it doesn't exist."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            caption TEXT,
+            tags TEXT,
+            media_type TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# Call this once when app starts
 init_db()
 
-@app.route("/")
+
+# =======================
+# Routes
+# =======================
+
+@app.route("/", methods=["GET"])
 def index():
+    """TikTok-style feed + search."""
     q = request.args.get("q", "").strip()
-    db = get_db()
+    conn = get_db()
+    cur = conn.cursor()
+
     if q:
-        rows = db.execute(
-            "SELECT * FROM images WHERE caption LIKE ? OR tags LIKE ? ORDER BY id DESC",
-            (f"%{q}%", f"%{q}%")
-        ).fetchall()
+        cur.execute(
+            """
+            SELECT id, filename, caption, tags, media_type, created_at
+            FROM posts
+            WHERE caption LIKE ? OR tags LIKE ?
+            ORDER BY created_at DESC
+            """,
+            (f"%{q}%", f"%{q}%"),
+        )
     else:
-        rows = db.execute("SELECT * FROM images ORDER BY id DESC").fetchall()
-    db.close()
-    return render_template_string("""
-    <h1>Kirk Archive</h1>
-    <form method="get">
-        <input name="q" placeholder="Search for kirk..." value="{{q}}">
-        <button type="submit">Search</button>
-    </form>
-    <form method="post" action="/upload" enctype="multipart/form-data">
-        <input type="file" name="image" required>
-        <input name="caption" placeholder="Caption">
-        <input name="tags" placeholder="Tags (comma-separated)">
-        <button type="submit">Upload</button>
-    </form>
-    <hr>
-    {% for im in images %}
-        <div>
-            <img src="/uploads/{{im['filename']}}" width="250"><br>
-            <b>{{im['caption']}}</b><br>
-            Tags: {{im['tags']}}<br><br>
-        </div>
-    {% endfor %}
-    """, images=rows, q=q)
+        cur.execute(
+            """
+            SELECT id, filename, caption, tags, media_type, created_at
+            FROM posts
+            ORDER BY created_at DESC
+            """
+        )
+
+    posts = cur.fetchall()
+    conn.close()
+
+    # posts is a list of rows; in template we can do post["caption"], etc.
+    return render_template("index.html", posts=posts, query=q)
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    file = request.files.get("image")
-    if not file or not allowed_file(file.filename):
-        abort(400, "Invalid file.")
-    filename = slugify(file.filename.rsplit('.', 1)[0]) + "-" + uuid.uuid4().hex[:8] + "." + file.filename.rsplit('.', 1)[1]
-    file.save(UPLOAD_DIR / filename)
-    caption = request.form.get("caption", "")
-    tags = request.form.get("tags", "")
-    db = get_db()
-    db.execute("INSERT INTO images(filename, caption, tags, created_at) VALUES(?,?,?,?)",
-               (filename, caption, tags, datetime.utcnow().isoformat()))
-    db.commit()
-    db.close()
+    """Handle file upload + save to DB."""
+    file = request.files.get("file")
+    caption = request.form.get("caption", "").strip()
+    tags = request.form.get("tags", "").strip()
+
+    if not file or file.filename == "":
+        return redirect(url_for("index"))
+
+    if not allowed_file(file.filename):
+        # For now just redirect; you can show a flash message later
+        return redirect(url_for("index"))
+
+    # Make filename safe & unique
+    original_name = file.filename
+    name, ext = os.path.splitext(original_name)
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    safe_filename = f"{name}_{timestamp}{ext}"
+    safe_filename = safe_filename.replace(" ", "_")
+
+    save_path = os.path.join(app.config["UPLOAD_FOLDER"], safe_filename)
+    file.save(save_path)
+
+    media_type = get_media_type(safe_filename)
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO posts (filename, caption, tags, media_type, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (safe_filename, caption, tags, media_type, datetime.utcnow()),
+    )
+    conn.commit()
+    conn.close()
+
     return redirect(url_for("index"))
 
-@app.route("/uploads/<path:filename>")
-def serve_upload(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
 
-@app.get("/health")
+# Simple health check (useful for Render)
+@app.route("/health")
 def health():
-    return jsonify({"ok": True, "time": time.time()})
+    return "ok", 200
 
+
+# =======================
+# Main
+# =======================
 if __name__ == "__main__":
-    app.run(debug=True)
+    # For local dev
+    app.run(debug=True, host="0.0.0.0", port=5000)
